@@ -1,10 +1,10 @@
 const std = @import("std");
-const log = std.log.scoped(.amqp);
+const log = std.log.scoped(.nats);
 
 const vsr = @import("../vsr.zig");
 const assert = std.debug.assert;
 const maybe = vsr.stdx.maybe;
-const fatal = @import("amqp/protocol.zig").fatal;
+const fatal = @import("nats/protocol.zig").fatal;
 
 const stdx = vsr.stdx;
 const IO = vsr.io.IO;
@@ -20,11 +20,11 @@ const Client = vsr.ClientType(StateMachine, MessageBus, vsr.time.Time);
 const TimestampRange = vsr.lsm.TimestampRange;
 const tb = vsr.tigerbeetle;
 
-pub const amqp = @import("amqp.zig");
+pub const nats = @import("nats.zig");
 
-/// CDC processor targeting an AMQP 0.9.1 compliant server (e.g., RabbitMQ).
+/// CDC processor targeting a NATS JetStream server.
 /// Producer: TigerBeetle `get_change_events` operation.
-/// Consumer: AMQP publisher.
+/// Consumer: NATS JetStream publisher.
 /// Both consumer and producer run concurrently using `io_uring`.
 /// See `DualBuffer` for more details.
 pub const Runner = struct {
@@ -41,8 +41,9 @@ pub const Runner = struct {
             constants.tick_ms,
         );
         const app_id = "tigerbeetle";
-        const progress_tracker_queue = "tigerbeetle.internal.progress";
-        const locker_queue = "tigerbeetle.internal.locker";
+        const progress_stream = "tigerbeetle.internal.progress";
+        const locker_stream = "tigerbeetle.internal.locker";
+        const event_stream = "tigerbeetle.events";
         const event_count_max: u32 = Client.StateMachine.operation_result_max(
             .get_change_events,
             vsr.constants.message_body_size_max,
@@ -58,17 +59,16 @@ pub const Runner = struct {
     vsr_client: Client,
     buffer: DualBuffer,
 
-    amqp_client: amqp.Client,
-    publish_exchange: []const u8,
-    publish_routing_key: []const u8,
-    progress_tracker_queue: []const u8,
-    locker_queue: []const u8,
+    nats_client: nats.Client,
+    event_subject: []const u8,
+    progress_stream: []const u8,
+    locker_stream: []const u8,
 
     connected: struct {
         /// VSR client registered.
         vsr: bool = false,
-        /// AMQP client connected and ready to publish.
-        amqp: bool = false,
+        /// NATS client connected and ready to publish.
+        nats: bool = false,
     },
     /// The producer is responsible for reading events from TigerBeetle.
     producer: enum {
@@ -79,7 +79,7 @@ pub const Runner = struct {
         waiting,
     },
 
-    /// The consumer is responsible to publish events on the AMQP server.
+    /// The consumer is responsible to publish events on the NATS server.
     consumer: enum {
         idle,
         publish,
@@ -93,12 +93,12 @@ pub const Runner = struct {
         recovering: struct {
             timestamp_last: ?u64,
             phase: union(enum) {
-                validate_exchange,
-                declare_locker_queue,
-                declare_progress_queue,
+                create_event_stream,
+                create_locker_stream,
+                create_progress_stream,
                 get_progress_message,
-                nack_progress_message: struct {
-                    delivery_tag: u64,
+                ack_progress_message: struct {
+                    sequence: u64,
                 },
             },
         },
@@ -118,18 +118,14 @@ pub const Runner = struct {
             cluster_id: u128,
             /// TigerBeetle cluster addresses.
             addresses: []const std.net.Address,
-            /// AMQP host address.
+            /// NATS server address.
             host: std.net.Address,
-            /// AMQP User name for PLAIN authentication.
-            user: []const u8,
-            /// AMQP Password for PLAIN authentication.
-            password: []const u8,
-            /// AMQP vhost.
-            vhost: []const u8,
-            /// AMQP exchange name for publishing messages.
-            publish_exchange: ?[]const u8,
-            /// AMQP routing key for publishing messages.
-            publish_routing_key: ?[]const u8,
+            /// NATS credentials (optional).
+            user: ?[]const u8,
+            /// NATS password (optional).
+            password: ?[]const u8,
+            /// NATS subject for publishing events.
+            event_subject: ?[]const u8,
             /// Overrides the number max of events produced/consumed each time.
             event_count_max: ?u32,
             /// Overrides the number of milliseconds to query again if there's no new events to
@@ -137,7 +133,7 @@ pub const Runner = struct {
             /// Must be greater than zero.
             idle_interval_ms: ?u32,
             /// Indicates whether to recover the last timestamp published on the state
-            /// tracker queue, or override it with a user-defined value.
+ 
             recovery_mode: StateRecoveryMode,
         },
     ) !void {
@@ -155,42 +151,36 @@ pub const Runner = struct {
             constants.event_count_max;
         assert(event_count_max > 0);
 
-        const publish_exchange: []const u8 = options.publish_exchange orelse "";
-        const publish_routing_key: []const u8 = options.publish_routing_key orelse "";
-        assert(publish_exchange.len > 0 or publish_routing_key.len > 0);
+        const event_subject: []const u8 = options.event_subject orelse
+            try std.fmt.allocPrint(allocator, "{s}.{}", .{ constants.event_stream, options.cluster_id });
+        errdefer if (options.event_subject == null) allocator.free(event_subject);
+        assert(event_subject.len > 0);
 
-        const progress_tracker_queue_owned: []const u8 = try std.fmt.allocPrint(
+        const progress_stream_owned: []const u8 = try std.fmt.allocPrint(
             allocator,
             "{s}.{}",
-            .{
-                constants.progress_tracker_queue,
-                options.cluster_id,
-            },
+            .{ constants.progress_stream, options.cluster_id },
         );
-        errdefer allocator.free(progress_tracker_queue_owned);
-        assert(progress_tracker_queue_owned.len <= 255);
+        errdefer allocator.free(progress_stream_owned);
+        assert(progress_stream_owned.len <= 255);
 
-        const locker_queue_owned: []const u8 = try std.fmt.allocPrint(
+        const locker_stream_owned: []const u8 = try std.fmt.allocPrint(
             allocator,
             "{s}.{}",
-            .{
-                constants.locker_queue,
-                options.cluster_id,
-            },
+            .{ constants.locker_stream, options.cluster_id },
         );
-        errdefer allocator.free(locker_queue_owned);
-        assert(locker_queue_owned.len <= 255);
+        errdefer allocator.free(locker_stream_owned);
+        assert(locker_stream_owned.len <= 255);
 
         const dual_buffer = try DualBuffer.init(allocator, event_count_max);
-        errdefer self.buffer.deinit(allocator);
+        errdefer dual_buffer.deinit(allocator);
 
         self.* = .{
             .idle_interval_ns = idle_interval_ns,
             .event_count_max = event_count_max,
-            .publish_exchange = publish_exchange,
-            .publish_routing_key = publish_routing_key,
-            .progress_tracker_queue = progress_tracker_queue_owned,
-            .locker_queue = locker_queue_owned,
+            .event_subject = event_subject,
+            .progress_stream = progress_stream_owned,
+            .locker_stream = locker_stream_owned,
             .connected = .{},
             .io = undefined,
             .producer = .idle,
@@ -200,7 +190,7 @@ pub const Runner = struct {
             .buffer = dual_buffer,
             .message_pool = undefined,
             .vsr_client = undefined,
-            .amqp_client = undefined,
+            .nats_client = undefined,
         };
 
         self.metrics = .{
@@ -230,32 +220,30 @@ pub const Runner = struct {
         });
         errdefer self.vsr_client.deinit(allocator);
 
-        self.amqp_client = try amqp.Client.init(allocator, .{
+        self.nats_client = try nats.Client.init(allocator, .{
             .io = &self.io,
             .message_count_max = self.event_count_max,
             .message_body_size_max = Message.json_string_size_max,
             .reply_timeout_ticks = constants.reply_timeout_ticks,
         });
-        errdefer self.amqp_client.deinit(allocator);
+        errdefer self.nats_client.deinit(allocator);
 
-        // Starting both the VSR and the AMQP clients:
-
-        try self.amqp_client.connect(
+        // Starting both the VSR and the NATS clients:
+        try self.nats_client.connect(
             &struct {
-                fn callback(context: *amqp.Client) void {
-                    const runner: *Runner = @alignCast(@fieldParentPtr("amqp_client", context));
-                    assert(!runner.connected.amqp);
+                fn callback(context: *nats.Client) void {
+                    const runner: *Runner = @alignCast(@fieldParentPtr("nats_client", context));
+                    assert(!runner.connected.nats);
                     maybe(runner.connected.vsr);
-                    log.info("AMQP connected.", .{});
-                    runner.connected.amqp = true;
+                    log.info("NATS connected.", .{});
+                    runner.connected.nats = true;
                     runner.recover();
                 }
             }.callback,
             .{
                 .host = options.host,
-                .user_name = options.user,
+                .user = options.user,
                 .password = options.password,
-                .vhost = options.vhost,
             },
         );
     }
@@ -263,29 +251,28 @@ pub const Runner = struct {
     pub fn deinit(self: *Runner, allocator: std.mem.Allocator) void {
         self.vsr_client.deinit(allocator);
         self.message_pool.deinit(allocator);
-        self.amqp_client.deinit(allocator);
+        self.nats_client.deinit(allocator);
         self.buffer.deinit(allocator);
-        allocator.free(self.progress_tracker_queue);
-        allocator.free(self.locker_queue);
+        allocator.free(self.progress_stream);
+        allocator.free(self.locker_stream);
+        if (self.event_subject.len > 0) allocator.free(self.event_subject);
     }
 
-    /// To make the CDC stateless, internal queues are used to store the state:
+    /// To make the CDC stateless, JetStream streams are used to store the state:
     ///
-    /// - Progress tracking queue:
-    ///   A persistent queue with a maximum size of 1 message and "drop head" behavior on overflow.
-    ///   During publishing, a message containing the last timestamp is pushed into this queue at
-    ///   the end of each published batch.
-    ///   On restart, the presence of a message indicates the `timestamp_min` from which to resume
-    ///   processing events. Otherwise, processing starts from the beginning.
-    ///   The queue name is generated to be unique based on the `cluster_id`.
+    /// - Progress tracking stream:
+    ///   A persistent stream with a maximum size of 1 message and discard-old policy.
+    ///   During publishing, a message containing the last timestamp is published to this stream
+    ///   at the end of each batch.
+    ///   On restart, the presence of a message indicates the `timestamp_min` to resume processing.
+    ///   The stream name is unique based on the `cluster_id`.
     ///   The initial timestamp can be overridden via the command line.
     ///
-    /// - Locker queue:
-    ///   A temporary, exclusive queue used to ensure that only a single CDC process is publishing
-    ///   at any given time. This queue is not used for publishing or consuming messages.
-    ///   The queue name is generated to be unique based on the `cluster_id`.
+    /// - Locker stream:
+    ///   A temporary stream used to ensure only one CDC process is publishing at a time.
+    ///   A consumer with a unique name is created to act as a lock.
     fn recover(self: *Runner) void {
-        assert(self.connected.amqp);
+        assert(self.connected.nats);
         assert(self.state == .unknown);
         const recovery_mode = self.state.unknown;
         const timestamp_override: ?u64 = switch (recovery_mode) {
@@ -293,78 +280,57 @@ pub const Runner = struct {
             .override => |timestamp| timestamp,
         };
 
-        const is_default_exchange = self.publish_exchange.len == 0;
         self.state = .{
             .recovering = .{
                 .timestamp_last = timestamp_override,
-                .phase = if (is_default_exchange)
-                    // No need to validate the default exchange, skipping `validate_exchange`.
-                    .declare_locker_queue
-                else
-                    .validate_exchange,
+                .phase = .create_event_stream,
             },
         };
         self.recover_dispatch();
     }
 
     fn recover_dispatch(self: *Runner) void {
-        assert(self.connected.amqp);
+        assert(self.connected.nats);
         assert(self.state == .recovering);
         switch (self.state.recovering.phase) {
-            // Check whether the exchange exists.
-            // Declaring the exchange with `passive==true` only asserts if it already exists.
-            .validate_exchange => {
-                assert(self.publish_exchange.len > 0);
-                maybe(self.state.recovering.timestamp_last == null);
-
-                self.amqp_client.exchange_declare(
+            .create_event_stream => {
+                self.nats_client.stream_create(
                     &struct {
-                        fn callback(context: *amqp.Client) void {
+                        fn callback(context: *nats.Client) void {
                             const runner: *Runner = @alignCast(@fieldParentPtr(
-                                "amqp_client",
+                                "nats_client",
                                 context,
                             ));
                             assert(runner.state == .recovering);
                             const recovering = &runner.state.recovering;
-                            assert(recovering.phase == .validate_exchange);
-                            maybe(recovering.timestamp_last == null);
-
-                            recovering.phase = .declare_locker_queue;
+                            assert(recovering.phase == .create_event_stream);
+                            recovering.phase = .create_locker_stream;
                             runner.recover_dispatch();
                         }
                     }.callback,
                     .{
-                        .exchange = self.publish_exchange,
-                        .type = "",
-                        .passive = true,
-                        .durable = false,
-                        .internal = false,
-                        .auto_delete = false,
+                        .name = self.event_subject,
+                        .subjects = &.{self.event_subject},
+                        .retention = .limits,
+                        .max_msgs = 0,
+                        .discard = .old,
+                        .storage = .file,
                     },
                 );
             },
-            // Declaring the locker queue.
-            // With `durable=false`, a temporary queue is created that exists only for the
-            // duration of the current connection, and with `exclusive=true`, no other connection
-            // can declare the same queue while this one is active.
-            // This effectively acts as a distributed lock to prevent multiple CDC
-            // instances from running simultaneously.
-            .declare_locker_queue => {
+            .create_locker_stream => {
                 maybe(self.state.recovering.timestamp_last == null);
-
-                self.amqp_client.queue_declare(
+                self.nats_client.stream_create(
                     &struct {
-                        fn callback(context: *amqp.Client) void {
+                        fn callback(context: *nats.Client) void {
                             const runner: *Runner = @alignCast(@fieldParentPtr(
-                                "amqp_client",
+                                "nats_client",
                                 context,
                             ));
                             switch (runner.state) {
                                 .recovering => |*recovering| {
-                                    assert(recovering.phase == .declare_locker_queue);
-                                    maybe(recovering.timestamp_last == null);
-
-                                    recovering.phase = .declare_progress_queue;
+                                    assert(recovering.phase == .create_locker_stream);
+                                    recovering.phase = .create_progress_stream;
                                     runner.recover_dispatch();
                                 },
                                 else => unreachable,
@@ -372,37 +338,27 @@ pub const Runner = struct {
                         }
                     }.callback,
                     .{
-                        .queue = self.locker_queue,
-                        .passive = false,
-                        .durable = false,
-                        .exclusive = true,
-                        .auto_delete = true,
-                        .arguments = .{
-                            .overflow = .drop_head,
-                            .max_length = 0,
-                            .max_length_bytes = 0,
-                            .single_active_consumer = true,
-                        },
+                        .name = self.locker_stream,
+                        .subjects = &.{self.locker_stream},
+                        .retention = .interest,
+                        .max_msgs = 0,
+                        .discard = .old,
+                        .storage = .memory,
                     },
                 );
             },
-            // Declaring the progress tracking queue.
-            // It's a no-op if the queue already exists.
-            .declare_progress_queue => {
+            .create_progress_stream => {
                 maybe(self.state.recovering.timestamp_last == null);
-
-                self.amqp_client.queue_declare(
+                self.nats_client.stream_create(
                     &struct {
-                        fn callback(context: *amqp.Client) void {
+                        fn callback(context: *nats.Client) void {
                             const runner: *Runner = @alignCast(@fieldParentPtr(
-                                "amqp_client",
+                                "nats_client",
                                 context,
                             ));
                             switch (runner.state) {
                                 .recovering => |*recovering| {
-                                    assert(recovering.phase == .declare_progress_queue);
-
-                                    // Overriding the progress-tracking timestamp.
+                                    assert(recovering.phase == .create_progress_stream);
                                     if (recovering.timestamp_last) |timestamp_override| {
                                         runner.state = .{
                                             .last = .{
@@ -412,8 +368,6 @@ pub const Runner = struct {
                                         };
                                         return runner.vsr_register();
                                     }
-                                    assert(recovering.timestamp_last == null);
-
                                     recovering.phase = .get_progress_message;
                                     runner.recover_dispatch();
                                 },
@@ -422,31 +376,25 @@ pub const Runner = struct {
                         }
                     }.callback,
                     .{
-                        .queue = self.progress_tracker_queue,
-                        .passive = false,
-                        .durable = true,
-                        .exclusive = false,
-                        .auto_delete = false,
-                        .arguments = .{
-                            .overflow = .drop_head,
-                            .max_length = 1,
-                            .max_length_bytes = 0,
-                            .single_active_consumer = true,
-                        },
+                        .name = self.progress_stream,
+                        .subjects = &.{self.progress_stream},
+                        .retention = .limits,
+                        .max_msgs = 1,
+                        .discard = .old,
+                        .storage = .file,
                     },
                 );
             },
-            // Getting the message header from the progress tracking queue.
             .get_progress_message => {
                 assert(self.state.recovering.timestamp_last == null);
-                self.amqp_client.get_message(
+                self.nats_client.get_message(
                     &struct {
                         fn callback(
-                            context: *amqp.Client,
-                            found: ?amqp.GetMessagePropertiesResult,
-                        ) amqp.Decoder.Error!void {
+                            context: *nats.Client,
+                            found: ?nats.GetMessageResult,
+                        ) nats.Error!void {
                             const runner: *Runner = @alignCast(@fieldParentPtr(
-                                "amqp_client",
+                                "nats_client",
                                 context,
                             ));
                             switch (runner.state) {
@@ -455,23 +403,10 @@ pub const Runner = struct {
                                     assert(recovering.timestamp_last == null);
 
                                     if (found) |result| {
-                                        // Since this queue is declared with `limit == 1`,
-                                        // we don't expect more than one message.
-                                        if (result.message_count > 0) fatal(
-                                            "Unexpected message_count={} in the progress queue.",
-                                            .{result.message_count},
-                                        );
-                                        assert(!result.has_body);
-                                        assert(result.delivery_tag > 0);
-                                        // Recovering from a valid timestamp is crucial,
-                                        // otherwise `get_change_events` may return empty results
-                                        // due to invalid filters.
                                         const progress_tracker = try ProgressTrackerMessage.parse(
-                                            result.properties.headers,
+                                            result.message,
                                         );
                                         assert(TimestampRange.valid(progress_tracker.timestamp));
-
-                                        // Downgrading the CDC job is not allowed.
                                         if (vsr.constants.state_machine_config.release.value <
                                             progress_tracker.release.value)
                                         {
@@ -484,17 +419,14 @@ pub const Runner = struct {
 
                                         recovering.timestamp_last = progress_tracker.timestamp;
                                         recovering.phase = .{
-                                            .nack_progress_message = .{
-                                                .delivery_tag = result.delivery_tag,
+                                            .ack_progress_message = .{
+                                                .sequence = result.sequence,
                                             },
                                         };
-
                                         return runner.recover_dispatch();
                                     }
 
-                                    // No previous progress record found,
-                                    // starting from the beginning.
-                                    assert(found == null);
+                                    // No previous progress record found, start from beginning.
                                     runner.state = .{ .last = .{
                                         .consumer_timestamp = 0,
                                         .producer_timestamp = TimestampRange.timestamp_min,
@@ -506,32 +438,30 @@ pub const Runner = struct {
                         }
                     }.callback,
                     .{
-                        .queue = self.progress_tracker_queue,
-                        .no_ack = false,
+                        .stream = self.progress_stream,
+                        .consumer = "progress_consumer",
                     },
                 );
             },
-            // Sending a `nack` with `requeue=true`, so the message remains in the progress
-            // tracking queue in case we restart and need to recover again.
-            .nack_progress_message => |message| {
+            .ack_progress_message => |message| {
                 assert(self.state.recovering.timestamp_last != null);
                 assert(TimestampRange.valid(self.state.recovering.timestamp_last.?));
-                assert(message.delivery_tag > 0);
+                assert(message.sequence > 0);
 
-                self.amqp_client.nack(&struct {
-                    fn callback(context: *amqp.Client) void {
+                self.nats_client.ack_message(&struct {
+                    fn callback(context: *nats.Client) void {
                         const runner: *Runner = @alignCast(@fieldParentPtr(
-                            "amqp_client",
+                            "nats_client",
                             context,
                         ));
                         switch (runner.state) {
                             .recovering => |*recovering| {
-                                assert(recovering.phase == .nack_progress_message);
+                                assert(recovering.phase == .ack_progress_message);
                                 assert(recovering.timestamp_last != null);
                                 assert(TimestampRange.valid(recovering.timestamp_last.?));
 
-                                const nack = recovering.phase.nack_progress_message;
-                                assert(nack.delivery_tag > 0);
+                                const seq = recovering.phase.ack_progress_message.sequence;
+                                assert(seq > 0);
 
                                 runner.state = .{ .last = .{
                                     .consumer_timestamp = recovering.timestamp_last.?,
@@ -543,23 +473,20 @@ pub const Runner = struct {
                         }
                     }
                 }.callback, .{
-                    .delivery_tag = message.delivery_tag,
-                    .requeue = true,
-                    .multiple = false,
+                    .stream = self.progress_stream,
+                    .sequence = message.sequence,
                 });
             },
         }
     }
 
     fn vsr_register(self: *Runner) void {
-        assert(self.connected.amqp);
+        assert(self.connected.nats);
         assert(!self.connected.vsr);
         assert(self.producer == .idle);
         assert(self.consumer == .idle);
         assert(self.state == .last);
 
-        // Register the VSR client as the last step to avoid unnecessarily joining the cluster
-        // in case the CDC fails due to connectivity or configuration issues with the AMQP server.
         self.vsr_client.register(
             &struct {
                 fn callback(
@@ -567,7 +494,7 @@ pub const Runner = struct {
                     result: *const vsr.RegisterResult,
                 ) void {
                     const runner: *Runner = @ptrFromInt(@as(usize, @intCast(user_data)));
-                    assert(runner.connected.amqp);
+                    assert(runner.connected.nats);
                     assert(!runner.connected.vsr);
                     log.info("VSR client registered.", .{});
                     runner.vsr_client.batch_size_limit = result.batch_size_limit;
@@ -581,11 +508,9 @@ pub const Runner = struct {
         );
     }
 
-    /// The "Producer" fetches events from TigerBeetle (`get_change_events` operation) into a buffer
-    /// to be consumed by the "Consumer".
     fn produce(self: *Runner) void {
         assert(self.connected.vsr);
-        assert(self.connected.amqp);
+        assert(self.connected.nats);
         assert(self.state == .last);
         assert(TimestampRange.valid(self.state.last.producer_timestamp));
         assert(self.state.last.consumer_timestamp == 0 or
@@ -594,8 +519,6 @@ pub const Runner = struct {
         switch (self.producer) {
             .idle => {
                 if (!self.buffer.producer_begin()) {
-                    // No free buffers (they must be `ready` and `consuming`).
-                    // The running consumer will resume the producer once it finishes.
                     assert(self.consumer != .idle);
                     assert(self.buffer.find(.ready) != null);
                     assert(self.buffer.find(.consuming) != null);
@@ -605,13 +528,13 @@ pub const Runner = struct {
                 self.metrics.producer.timer.reset();
                 self.produce_dispatch();
             },
-            else => unreachable, // Already running.
+            else => unreachable,
         }
     }
 
     fn produce_dispatch(self: *Runner) void {
         assert(self.connected.vsr);
-        assert(self.connected.amqp);
+        assert(self.connected.nats);
         assert(self.state == .last);
         assert(TimestampRange.valid(self.state.last.producer_timestamp));
         assert(self.state.last.consumer_timestamp == 0 or
@@ -619,7 +542,6 @@ pub const Runner = struct {
         assert(self.state.last.producer_timestamp > self.state.last.consumer_timestamp);
         switch (self.producer) {
             .idle => unreachable,
-            // Submitting the request through the VSR client.
             .request => {
                 const filter: tb.ChangeEventsFilter = .{
                     .limit = self.event_count_max,
@@ -634,8 +556,6 @@ pub const Runner = struct {
                     std.mem.asBytes(&filter),
                 );
             },
-            // No running consumer and no events returned from the last query,
-            // waiting for the timeout to resume the producer.
             .waiting => {
                 self.io.timeout(
                     *Runner,
@@ -690,8 +610,6 @@ pub const Runner = struct {
         runner.buffer.producer_finish(@intCast(source.len));
 
         if (runner.buffer.all_free()) {
-            // No events to publish.
-            // Going idle and will check again for new events.
             assert(source.len == 0);
             assert(runner.consumer == .idle);
             runner.producer = .waiting;
@@ -706,20 +624,14 @@ pub const Runner = struct {
             assert(TimestampRange.valid(timestamp_next));
             runner.state.last.producer_timestamp = timestamp_next;
 
-            // Since the buffer was populated,
-            // resume consuming (if not already running).
             if (runner.consumer == .idle) runner.consume();
-
-            // Resume producing (if there's a free buffer).
             runner.produce();
         }
     }
 
-    /// The "Consumer" reads from the buffer populated by the "Producer"
-    /// and publishes the events to the AMQP server.
     fn consume(self: *Runner) void {
         assert(self.connected.vsr);
-        assert(self.connected.amqp);
+        assert(self.connected.nats);
         assert(self.state == .last);
         assert(TimestampRange.valid(self.state.last.producer_timestamp));
         assert(self.state.last.consumer_timestamp == 0 or
@@ -728,8 +640,6 @@ pub const Runner = struct {
         switch (self.consumer) {
             .idle => {
                 if (!self.buffer.consumer_begin()) {
-                    // No buffers ready (they must be both `free` or still `producing`).
-                    // The running/waiting producer will resume the consumer once it finishes.
                     if (self.buffer.all_free()) {
                         assert(self.producer == .idle);
                     } else {
@@ -743,13 +653,13 @@ pub const Runner = struct {
                 self.metrics.consumer.timer.reset();
                 self.consume_dispatch();
             },
-            else => unreachable, // Already running.
+            else => unreachable,
         }
     }
 
     fn consume_dispatch(self: *Runner) void {
         assert(self.connected.vsr);
-        assert(self.connected.amqp);
+        assert(self.connected.nats);
         assert(self.state == .last);
         assert(TimestampRange.valid(self.state.last.producer_timestamp));
         assert(self.state.last.consumer_timestamp == 0 or
@@ -757,41 +667,21 @@ pub const Runner = struct {
         assert(self.state.last.producer_timestamp > self.state.last.consumer_timestamp);
         switch (self.consumer) {
             .idle => unreachable,
-            // Publishes a batch of events and waits until the AMQP server acknowledges it.
-            // N.B.: TigerBeetle guarantees at-least-once semantics when publishing,
-            // and makes a best effort to prevent duplicate messages.
-            // Publishing uses `confirm.select` instead of `tx.select`, as the former provides
-            // better performance with equivalent delivery guarantees. However, neither can
-            // ensure exactly-once delivery in case of crashes in the middle of the operation.
-            // From https://www.rabbitmq.com/docs/semantics:
-            // "RabbitMQ provides no atomicity guarantees even in case of transactions involving
-            // just a single queue, e.g. a fault during tx.commit can result in a sub-set of the
-            // transaction's publishes appearing in the queue after a broker restart.
             .publish => {
                 const events: []const tb.ChangeEvent = self.buffer.get_consumer_buffer();
                 assert(events.len > 0);
                 for (events) |*event| {
                     const message = Message.init(event);
-                    self.amqp_client.publish_enqueue(.{
-                        .exchange = self.publish_exchange,
-                        .routing_key = self.publish_routing_key,
-                        .mandatory = true,
-                        .immediate = false,
-                        .properties = .{
-                            .content_type = Message.content_type,
-                            .delivery_mode = .persistent,
-                            .app_id = constants.app_id,
-                            // AMQP timestamp in seconds.
-                            .timestamp = @divTrunc(event.timestamp, std.time.ns_per_s),
-                            .headers = message.header(),
-                        },
+                    self.nats_client.publish_enqueue(.{
+                        .subject = self.event_subject,
                         .body = message.body(),
+                        .headers = message.header(),
                     });
                 }
-                self.amqp_client.publish_send(&struct {
-                    fn callback(context: *amqp.Client) void {
+                self.nats_client.publish_send(&struct {
+                    fn callback(context: *nats.Client) void {
                         const runner: *Runner = @alignCast(@fieldParentPtr(
-                            "amqp_client",
+                            "nats_client",
                             context,
                         ));
                         assert(runner.consumer == .publish);
@@ -800,8 +690,6 @@ pub const Runner = struct {
                     }
                 }.callback);
             },
-            // Publishes the progress-tracking message containing the last timestamp
-            // *after* the batch of events has been acknowledged by the AMQP server.
             .progress_update => {
                 const progress_tracker: ProgressTrackerMessage = progress: {
                     const events = self.buffer.get_consumer_buffer();
@@ -811,22 +699,15 @@ pub const Runner = struct {
                         .release = vsr.constants.state_machine_config.release,
                     };
                 };
-                self.amqp_client.publish_enqueue(.{
-                    .exchange = "", // No exchange sends directly to this queue.
-                    .routing_key = self.progress_tracker_queue,
-                    .mandatory = true,
-                    .immediate = false,
-                    .properties = .{
-                        .delivery_mode = .persistent,
-                        .timestamp = @intCast(std.time.milliTimestamp()),
-                        .headers = progress_tracker.header(),
-                    },
-                    .body = null,
+                self.nats_client.publish_enqueue(.{
+                    .subject = self.progress_stream,
+                    .body = progress_tracker.body(),
+                    .headers = progress_tracker.header(),
                 });
-                self.amqp_client.publish_send(&struct {
-                    fn callback(context: *amqp.Client) void {
+                self.nats_client.publish_send(&struct {
+                    fn callback(context: *nats.Client) void {
                         const runner: *Runner = @alignCast(@fieldParentPtr(
-                            "amqp_client",
+                            "nats_client",
                             context,
                         ));
                         assert(runner.consumer == .progress_update);
@@ -839,13 +720,10 @@ pub const Runner = struct {
                         runner.buffer.consumer_finish();
                         runner.state.last.consumer_timestamp = timestamp_last;
 
-                        // Resume consuming (if there's a buffer ready).
                         runner.consumer = .idle;
                         runner.metrics.consumer.record(event_count);
                         runner.consume();
 
-                        // Since the buffer was released,
-                        // resume producing (if not already running).
                         if (runner.producer == .idle) runner.produce();
                     }
                 }.callback);
@@ -856,7 +734,7 @@ pub const Runner = struct {
     pub fn tick(self: *Runner) void {
         assert(!self.vsr_client.evicted);
         self.vsr_client.tick();
-        self.amqp_client.tick();
+        self.nats_client.tick();
         self.io.run_for_ns(constants.tick_ms * std.time.ns_per_ms) catch unreachable;
 
         self.metrics.tick();
@@ -942,7 +820,7 @@ const Metrics = struct {
 };
 
 /// Buffers swapped between producer and consumer, allowing reading from TigerBeetle
-/// and publishing to AMQP to happen concurrently.
+/// and publishing to NATS to happen concurrently.
 const DualBuffer = struct {
     const State = enum {
         free,
@@ -993,11 +871,8 @@ const DualBuffer = struct {
 
     pub fn producer_begin(self: *DualBuffer) bool {
         self.assert_state();
-        // Already producing.
         assert(self.find(.producing) == null);
-        const buffer = self.find(.free) orelse
-            // No free buffers.
-            return false;
+        const buffer = self.find(.free) orelse return false;
         buffer.state = .producing;
         return true;
     }
@@ -1016,11 +891,8 @@ const DualBuffer = struct {
 
     pub fn consumer_begin(self: *DualBuffer) bool {
         self.assert_state();
-        // Already consuming.
         assert(self.find(.consuming) == null);
-        const buffer = self.find(.ready) orelse
-            // No buffers ready.
-            return false;
+        const buffer = self.find(.ready) orelse return false;
         const count = buffer.state.ready;
         buffer.state = .{ .consuming = count };
         return true;
@@ -1051,8 +923,6 @@ const DualBuffer = struct {
     }
 
     fn assert_state(self: *const DualBuffer) void {
-        // Two buffers: one can be producing while the other is consuming,
-        // but never two consumers or producers.
         assert(!(self.buffer_1.state == .producing and self.buffer_2.state == .producing));
         assert(!(self.buffer_1.state == .consuming and self.buffer_2.state == .consuming));
         assert(!(self.buffer_1.state == .ready and self.buffer_2.state == .ready));
@@ -1060,16 +930,16 @@ const DualBuffer = struct {
     }
 };
 
-/// Progress tracker message with no body, containing the timestamp
+/// Progress tracker message with JSON body, containing the timestamp
 /// and the release version of the last acknowledged publish.
 const ProgressTrackerMessage = struct {
     release: vsr.Release,
     timestamp: u64,
 
-    fn header(self: *const ProgressTrackerMessage) amqp.Encoder.Table {
-        const vtable: amqp.Encoder.Table.VTable = comptime .{
+    fn header(self: *const ProgressTrackerMessage) nats.Encoder.Headers {
+        const vtable: nats.Encoder.Headers.VTable = comptime .{
             .write = &struct {
-                fn write(context: *const anyopaque, encoder: *amqp.Encoder.TableEncoder) void {
+                fn write(context: *const anyopaque, encoder: *nats.Encoder.HeadersEncoder) void {
                     const message: *const ProgressTrackerMessage = @ptrCast(@alignCast(context));
                     var release_buffer: [
                         std.fmt.count("{}", vsr.Release.from(.{
@@ -1078,56 +948,57 @@ const ProgressTrackerMessage = struct {
                             .patch = std.math.maxInt(u8),
                         }))
                     ]u8 = undefined;
-                    encoder.put("release", .{ .string = std.fmt.bufPrint(
+                    encoder.put("release", std.fmt.bufPrint(
                         &release_buffer,
                         "{}",
                         .{message.release},
-                    ) catch unreachable });
-                    encoder.put("timestamp", .{ .int64 = @intCast(message.timestamp) });
+                    ) catch unreachable);
+                    encoder.put("timestamp", std.fmt.comptimePrint("{}", .{message.timestamp}));
                 }
             }.write,
         };
         return .{ .context = self, .vtable = &vtable };
     }
 
-    fn parse(table: ?amqp.Decoder.Table) amqp.Decoder.Error!ProgressTrackerMessage {
-        if (table) |headers| {
-            var timestamp: ?u64 = null;
-            var release: ?vsr.Release = null;
-
-            // Intentionally allows the presence of header fields other than `timestamp`,
-            // since some plugin may insert additional headers into messages.
-            var iterator = headers.iterator();
-            while (try iterator.next()) |entry| {
-                if (std.mem.eql(u8, entry.key, "timestamp")) {
-                    switch (entry.value) {
-                        .int64 => |int64| {
-                            const value: u64 = @intCast(int64);
-                            if (!TimestampRange.valid(value)) break;
-                            timestamp = value;
-                        },
-                        else => break,
-                    }
+    fn body(self: *const ProgressTrackerMessage) nats.Encoder.Body {
+        const vtable: nats.Encoder.Body.VTable = comptime .{
+            .write = &struct {
+                fn write(context: *const anyopaque, buffer: []u8) usize {
+                    const message: *const ProgressTrackerMessage = @ptrCast(@alignCast(context));
+                    var fbs = std.io.fixedBufferStream(buffer);
+                    std.json.stringify(.{
+                        .release = message.release,
+                        .timestamp = message.timestamp,
+                    }, .{
+                        .whitespace = .minified,
+                    }, fbs.writer()) catch unreachable;
+                    return fbs.pos;
                 }
-                if (std.mem.eql(u8, entry.key, "release")) {
-                    switch (entry.value) {
-                        .string => |value| {
-                            release = vsr.Release.parse(value) catch break;
-                        },
-                        else => break,
-                    }
-                }
+            }.write,
+        };
+        return .{ .context = self, .vtable = &vtable };
+    }
 
-                if (timestamp != null and release != null) return .{
-                    .timestamp = timestamp.?,
-                    .release = release.?,
-                };
-            }
+    fn parse(message: []const u8) nats.Error!ProgressTrackerMessage {
+        const parsed = try std.json.parseFromSlice(
+            struct { release: []const u8, timestamp: u64 },
+            std.heap.page_allocator,
+            message,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+
+        const release = vsr.Release.parse(parsed.value.release) catch
+            fatal("Invalid progress tracker message release format.", .{});
+        const timestamp = parsed.value.timestamp;
+        if (!TimestampRange.valid(timestamp)) {
+            fatal("Invalid progress tracker message timestamp.", .{});
         }
-        fatal(
-            \\Invalid progress tracker message.
-            \\Use `--timestamp-last` to restore a valid initial timestamp.
-        , .{});
+
+        return .{
+            .timestamp = timestamp,
+            .release = release,
+        };
     }
 };
 
@@ -1238,32 +1109,24 @@ pub const Message = struct {
         };
     }
 
-    fn header(self: *const Message) amqp.Encoder.Table {
-        const vtable: amqp.Encoder.Table.VTable = comptime .{
+    fn header(self: *const Message) nats.Encoder.Headers {
+        const vtable: nats.Encoder.Headers.VTable = comptime .{
             .write = &struct {
-                fn write(context: *const anyopaque, encoder: *amqp.Encoder.TableEncoder) void {
+                fn write(context: *const anyopaque, encoder: *nats.Encoder.HeadersEncoder) void {
                     const message: *const Message = @ptrCast(@alignCast(context));
-                    encoder.put("event_type", .{ .string = @tagName(message.type) });
-
-                    // N.B.: Unsigned integers like u32 and u16 are not universally supported by
-                    // all RabbitMQ clients.
-                    // To ensure compatibility, we promote them to a signed integer.
-                    encoder.put("ledger", .{ .int64 = message.ledger });
-                    encoder.put("transfer_code", .{ .int32 = message.transfer.code });
-                    encoder.put("debit_account_code", .{
-                        .int32 = message.debit_account.code,
-                    });
-                    encoder.put("credit_account_code", .{
-                        .int32 = message.credit_account.code,
-                    });
+                    encoder.put("event_type", @tagName(message.type));
+                    encoder.put("ledger", std.fmt.comptimePrint("{}", .{message.ledger}));
+                    encoder.put("transfer_code", std.fmt.comptimePrint("{}", .{message.transfer.code}));
+                    encoder.put("debit_account_code", std.fmt.comptimePrint("{}", .{message.debit_account.code}));
+                    encoder.put("credit_account_code", std.fmt.comptimePrint("{}", .{message.credit_account.code}));
                 }
             }.write,
         };
         return .{ .context = self, .vtable = &vtable };
     }
 
-    fn body(self: *const Message) amqp.Encoder.Body {
-        const vtable: amqp.Encoder.Body.VTable = comptime .{
+    fn body(self: *const Message) nats.Encoder.Body {
+        const vtable: nats.Encoder.Body.VTable = comptime .{
             .write = &struct {
                 fn write(context: *const anyopaque, buffer: []u8) usize {
                     const message: *const Message = @ptrCast(@alignCast(context));
@@ -1279,7 +1142,6 @@ pub const Message = struct {
         return .{ .context = self, .vtable = &vtable };
     }
 
-    /// Fill all fields for the largest string representation.
     fn worse_case(comptime T: type) T {
         var value: T = undefined;
         for (std.meta.fields(T)) |field| {
@@ -1304,7 +1166,7 @@ pub const Message = struct {
 
 const testing = std.testing;
 
-test "amqp: DualBuffer" {
+test "nats: DualBuffer" {
     const event_count_max = Runner.constants.event_count_max;
 
     var prng = stdx.PRNG.from_seed(42);
@@ -1314,11 +1176,9 @@ test "amqp: DualBuffer" {
     for (0..4096) |_| {
         try testing.expect(dual_buffer.all_free());
 
-        // Starts a producer:
         const producer_begin = dual_buffer.producer_begin();
         try testing.expect(producer_begin);
         try testing.expect(!dual_buffer.all_free());
-        // We can't consume yet.
         try testing.expect(!dual_buffer.consumer_begin());
 
         const producer1_buffer = dual_buffer.get_producer_buffer();
@@ -1328,12 +1188,10 @@ test "amqp: DualBuffer" {
         prng.fill(std.mem.sliceAsBytes(producer1_buffer[0..producer1_count]));
         dual_buffer.producer_finish(producer1_count);
 
-        // Starts a consumer after the producer has finished:
         const consumer_begin = dual_buffer.consumer_begin();
         try testing.expect(consumer_begin);
         try testing.expect(!dual_buffer.all_free());
 
-        // Concurrently starts another producer:
         const producer_begin_concurrently = dual_buffer.producer_begin();
         try testing.expect(producer_begin_concurrently);
         try testing.expect(!dual_buffer.all_free());
@@ -1342,11 +1200,10 @@ test "amqp: DualBuffer" {
         try testing.expectEqual(@as(usize, event_count_max), producer2_buffer.len);
 
         const producer2_count = prng.range_inclusive(u32, 0, event_count_max);
-        maybe(producer2_count == 0); // Testing zeroed producers.
+        maybe(producer2_count == 0);
         prng.fill(std.mem.sliceAsBytes(producer2_buffer[0..producer2_count]));
         dual_buffer.producer_finish(producer2_count);
 
-        // Consuming the first producer:
         const consumer_buffer = dual_buffer.get_consumer_buffer();
         try testing.expectEqual(producer1_buffer.ptr, consumer_buffer.ptr);
         try testing.expectEqual(@as(usize, producer1_count), consumer_buffer.len);
@@ -1357,8 +1214,6 @@ test "amqp: DualBuffer" {
         );
         dual_buffer.consumer_finish();
 
-        // Consuming the second producer.
-        // It might not have produced anything, so the buffer cannot be consumed:
         const consumer_begin_again = dual_buffer.consumer_begin();
         if (producer2_count == 0) {
             try testing.expect(!consumer_begin_again);
@@ -1383,8 +1238,8 @@ test "amqp: DualBuffer" {
     }
 }
 
-test "amqp: ProgressTrackerMessage" {
-    const buffer = try testing.allocator.alloc(u8, amqp.frame_min_size);
+test "nats: ProgressTrackerMessage" {
+    const buffer = try testing.allocator.alloc(u8, 256);
     defer testing.allocator.free(buffer);
 
     const values: []const u64 = &.{
@@ -1397,17 +1252,14 @@ test "amqp: ProgressTrackerMessage" {
             .release = vsr.Release.minimum,
             .timestamp = value,
         };
-        var encoder = amqp.Encoder.init(buffer);
-        encoder.write_table(message.header());
-
-        var decoder = amqp.Decoder.init(buffer[0..encoder.index]);
-        const decoded_message = try ProgressTrackerMessage.parse(try decoder.read_table());
+        const size = message.body().write(buffer);
+        const decoded_message = try ProgressTrackerMessage.parse(buffer[0..size]);
         try testing.expectEqual(message.release.value, decoded_message.release.value);
         try testing.expectEqual(message.timestamp, decoded_message.timestamp);
     }
 }
 
-test "amqp: JSON message" {
+test "nats: JSON message" {
     const Snap = @import("../testing/snaptest.zig").Snap;
     const snap = Snap.snap;
 
